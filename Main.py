@@ -3,20 +3,22 @@ import pytesseract
 import pandas as pd
 from ultralytics import YOLO
 import os
+import shutil
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageTk, ImageEnhance, ImageFilter
+from PIL import Image, ImageTk
 import numpy as np
 import re
-import time
 import easyocr
 from difflib import SequenceMatcher
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 class LicensePlateSystem:
     def __init__(self):
         try:
             # Use a specialized license plate detection model if available
-            self.model = YOLO("yolov8n.pt")
+            self.model = YOLO(os.path.join(_BASE_DIR, "yolov8n.pt"))
         except Exception as e:
             print(f"Error loading YOLO model: {e}")
             self.model = None
@@ -24,15 +26,9 @@ class LicensePlateSystem:
         # Initialize EasyOCR reader
         self.reader = easyocr.Reader(['en'])
         
-        self.blacklist_file = "blacklist.csv"
+        self.blacklist_file = os.path.join(_BASE_DIR, "blacklist.csv")
         self.ensure_blacklist_exists()
         self.blacklist = self.load_blacklist()
-        
-        # Common OCR misreadings mapping
-        self.ocr_corrections = {
-            'O': '0', 'I': '1', 'Z': '2', 'S': '5', 
-            'D': '0', 'G': '6', 'T': '7', ' ': '', '.': '', '-': ''
-        }
 
     def ensure_blacklist_exists(self):
         if not os.path.exists(self.blacklist_file):
@@ -103,6 +99,11 @@ class LicensePlateSystem:
             for contour in contours:
                 # Get rectangle bounding contour
                 x, y, w, h = cv2.boundingRect(contour)
+
+                # Guard against degenerate contours
+                if h == 0:
+                    continue
+
                 aspect_ratio = w / float(h)
                 area = w * h
                 
@@ -112,7 +113,9 @@ class LicensePlateSystem:
                     
                     # Additional check for text-like regions
                     plate_gray = cv2.cvtColor(plate_region, cv2.COLOR_BGR2GRAY)
-                    sobelx = cv2.Sobel(plate_gray, cv2.CV_8U, 1, 0, ksize=3)
+                    # Use CV_64F to capture gradients in both directions, then take absolute value
+                    sobelx = cv2.Sobel(plate_gray, cv2.CV_64F, 1, 0, ksize=3)
+                    sobelx = np.abs(sobelx)
                     sobel_density = np.sum(sobelx > 0) / (w * h)
                     
                     if sobel_density > 0.1:
@@ -155,11 +158,19 @@ class LicensePlateSystem:
             new_height = int(height * scale)
             gray = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
         
+        # Enhance contrast using CLAHE (applied to grayscale before thresholding)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        
         # Apply bilateral filter to reduce noise while keeping edges sharp
-        filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+        filtered = cv2.bilateralFilter(enhanced, 9, 75, 75)
+        
+        # Apply sharpening filter (on grayscale, before thresholding)
+        kernel_sharpen = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        sharpened = cv2.filter2D(filtered, -1, kernel_sharpen)
         
         # Apply adaptive thresholding
-        thresh = cv2.adaptiveThreshold(filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        thresh = cv2.adaptiveThreshold(sharpened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                       cv2.THRESH_BINARY, 11, 2)
         
         # Apply morphological operations to clean up the image
@@ -167,22 +178,37 @@ class LicensePlateSystem:
         morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
         morph = cv2.morphologyEx(morph, cv2.MORPH_OPEN, kernel)
         
-        # Enhance contrast using CLAHE
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(morph)
-        
-        # Apply sharpening filter
-        kernel_sharpen = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-        sharpened = cv2.filter2D(enhanced, -1, kernel_sharpen)
-        
-        return sharpened
+        return morph
 
     def correct_common_ocr_errors(self, text):
-        """Correct common OCR misreadings"""
-        corrected = text.upper()
-        for wrong, right in self.ocr_corrections.items():
-            corrected = corrected.replace(wrong, right)
-        return corrected
+        """Correct common OCR misreadings using position-aware logic.
+
+        Indian plates follow the pattern: SS DD LL NNNN
+        (state letters, district digits, series letters, serial digits).
+        Alternating letter/digit groups are corrected accordingly.
+        """
+        text = text.upper()
+
+        # Maps for common OCR confusions
+        letter_to_digit = {'O': '0', 'I': '1', 'Z': '2', 'S': '5',
+                           'D': '0', 'G': '6', 'T': '7', 'B': '8'}
+        digit_to_letter = {'0': 'O', '1': 'I', '5': 'S', '6': 'G',
+                           '7': 'T', '8': 'B'}
+
+        # Split into alternating letter and digit groups
+        groups = re.findall(r'[A-Z]+|[0-9]+', text)
+
+        corrected_groups = []
+        for i, group in enumerate(groups):
+            if i % 2 == 0:
+                # Even groups are expected to be letters (state code, series)
+                corrected = ''.join(digit_to_letter.get(c, c) for c in group)
+            else:
+                # Odd groups are expected to be digits (district code, serial)
+                corrected = ''.join(letter_to_digit.get(c, c) for c in group)
+            corrected_groups.append(corrected)
+
+        return ''.join(corrected_groups)
 
     def validate_plate_format(self, text):
         """Validate if text looks like a license plate"""
@@ -291,13 +317,13 @@ class LicensePlateSystem:
                 best_text, best_confidence, method = results[0]
                 
                 print(f"Selected text: {best_text} with confidence {best_confidence} from {method}")
-                return best_text
+                return best_text, processed_img
             
-            return "UNREADABLE"
+            return "UNREADABLE", processed_img
             
         except Exception as e:
             print(f"Error in OCR: {e}")
-            return "ERROR"
+            return "ERROR", None
 
     def check_blacklist(self, plate_text):
         if not plate_text or plate_text in ["UNREADABLE", "ERROR"]:
@@ -328,11 +354,9 @@ class LicensePlateSystem:
 try:
     if os.path.exists(r'C:\Program Files\Tesseract-OCR\tesseract.exe'):
         pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-    elif os.system('which tesseract') == 0:
-        pass
-    else:
+    elif shutil.which('tesseract') is None:
         print("Warning: Tesseract not found. Please install Tesseract OCR.")
-except:
+except Exception:
     pass
 
 class LicensePlateApp:
@@ -474,7 +498,7 @@ class LicensePlateApp:
             results = []
             for i, plate_img in enumerate(self.plate_images):
                 try:
-                    plate_text = self.lp_system.extract_plate_text(plate_img)
+                    plate_text, processed_img = self.lp_system.extract_plate_text(plate_img)
                     is_blacklisted, reason = self.lp_system.check_blacklist(plate_text)
                     
                     if plate_text in ["UNREADABLE", "ERROR"]:
@@ -489,7 +513,8 @@ class LicensePlateApp:
                         'status': status,
                         'reason': reason,
                         'is_blacklisted': is_blacklisted,
-                        'plate_img': plate_img
+                        'plate_img': plate_img,
+                        'processed_img': processed_img
                     })
                     
                 except Exception as e:
@@ -499,7 +524,8 @@ class LicensePlateApp:
                         'status': "ERROR",
                         'reason': f"Processing error: {str(e)}",
                         'is_blacklisted': False,
-                        'plate_img': None
+                        'plate_img': None,
+                        'processed_img': None
                     })
             
             # Store results for debug view
@@ -602,8 +628,8 @@ class LicensePlateApp:
                     orig_img_label.image = plate_photo
                     orig_img_label.pack(pady=5)
                     
-                    # Processed image
-                    processed_img = self.lp_system.advanced_preprocess(result['plate_img'])
+                    # Processed image (use cached result to avoid redundant reprocessing)
+                    processed_img = result.get('processed_img')
                     if processed_img is not None:
                         proc_pil = Image.fromarray(processed_img)
                         proc_pil.thumbnail(display_size, Image.Resampling.LANCZOS)
