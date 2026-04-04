@@ -186,6 +186,10 @@ class LicensePlateSystem:
         Indian plates follow the pattern: SS DD LL NNNN
         (state letters, district digits, series letters, serial digits).
         Alternating letter/digit groups are corrected accordingly.
+
+        Note: Z→2 and D→0 in letter_to_digit have no reverse mapping in
+        digit_to_letter because '2' and '0' are unambiguous digits that should
+        never be corrected to a letter in a letter position.
         """
         text = text.upper()
 
@@ -200,12 +204,22 @@ class LicensePlateSystem:
 
         corrected_groups = []
         for i, group in enumerate(groups):
-            if i % 2 == 0:
-                # Even groups are expected to be letters (state code, series)
+            # Verify group type before applying corrections to avoid
+            # misidentifying groups when OCR output is irregular.
+            group_is_letters = all(c.isalpha() for c in group)
+            group_is_digits = all(c.isdigit() for c in group)
+
+            if i % 2 == 0 and group_is_letters:
+                # Even groups expected to be letters (state code, series):
+                # correct digit look-alikes back to letters.
                 corrected = ''.join(digit_to_letter.get(c, c) for c in group)
-            else:
-                # Odd groups are expected to be digits (district code, serial)
+            elif i % 2 == 1 and group_is_digits:
+                # Odd groups expected to be digits (district code, serial):
+                # correct letter look-alikes back to digits.
                 corrected = ''.join(letter_to_digit.get(c, c) for c in group)
+            else:
+                # Mixed or unexpected group — leave as-is.
+                corrected = group
             corrected_groups.append(corrected)
 
         return ''.join(corrected_groups)
@@ -629,7 +643,7 @@ class LicensePlateApp:
                     orig_img_label.pack(pady=5)
                     
                     # Processed image (use cached result to avoid redundant reprocessing)
-                    processed_img = result.get('processed_img')
+                    processed_img = result.get('processed_img', None)
                     if processed_img is not None:
                         proc_pil = Image.fromarray(processed_img)
                         proc_pil.thumbnail(display_size, Image.Resampling.LANCZOS)
